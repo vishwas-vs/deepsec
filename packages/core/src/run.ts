@@ -109,11 +109,34 @@ export function createRunMeta(params: {
     createdAt: new Date().toISOString(),
     type: params.type,
     phase: "running",
+    pid: process.pid,
+    hostname: os.hostname(),
     scannerConfig: params.scannerConfig,
     processorConfig: params.processorConfig,
     stats: {},
   };
   return meta;
+}
+
+/**
+ * Best-effort PID liveness check. `process.kill(pid, 0)` doesn't actually
+ * signal the process — it just probes whether the kernel would deliver a
+ * signal. ESRCH means "no such process" (genuinely dead). EPERM means the
+ * PID exists but is owned by a different user, which on a single-user
+ * developer machine effectively never happens; we treat it as "alive" to
+ * stay on the safe side. Returns `true` on any other failure for the same
+ * reason — false-positive reclaims clobber findings, false negatives just
+ * cost a retry on the next run.
+ */
+export function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false;
+    return true;
+  }
 }
 
 export function writeRunMeta(meta: RunMeta): void {
@@ -139,6 +162,94 @@ export function completeRun(
   meta.completedAt = new Date().toISOString();
   if (stats) Object.assign(meta.stats, stats);
   writeRunMeta(meta);
+}
+
+// --- Run-level shutdown handling ---
+//
+// Why this exists: when the CLI gets Ctrl+C'd (SIGINT) or killed
+// (SIGTERM), the long-running `process()` / `revalidate()` body exits
+// without reaching its `completeRun(..., "done")` call. The run's
+// RunMeta stays at `phase: "running"` forever, and every file the run
+// claimed stays at `status: "processing"` with that run's lockedByRunId.
+// The lock-reclaim logic only treats such locks as reclaimable after
+// `STALE_LOCK_MS` (1h), so files are effectively stuck for an hour.
+//
+// We fix the graceful-shutdown case (~99% of interruptions) by flipping
+// the run to `phase: "error"` from a SIGINT/SIGTERM handler. That single
+// synchronous write makes every claimed file immediately reclaimable on
+// the next invocation. Hard kills (SIGKILL / OOM / power) bypass this
+// handler, but those are covered by the PID-liveness check in
+// `isReclaimableLock`.
+const activeRuns = new Map<string, { projectId: string; runId: string }>();
+let shutdownHandlersInstalled = false;
+
+function flushActiveRuns(): void {
+  // Snapshot to a fresh array — completeRun's read+write can throw if
+  // the meta file was already cleaned up, and we don't want one bad
+  // entry to skip the rest.
+  for (const { projectId, runId } of [...activeRuns.values()]) {
+    try {
+      // Only flip if the run is still "running". Sequential
+      // process()/revalidate() calls in the same node process may
+      // leave already-completed entries in the Map if the caller
+      // forgets to unregister; flipping those would corrupt their
+      // phase ("done" → "error").
+      const meta = readRunMeta(projectId, runId);
+      if (meta.phase !== "running") continue;
+      completeRun(projectId, runId, "error");
+    } catch {
+      // best-effort
+    }
+  }
+  activeRuns.clear();
+}
+
+function installShutdownHandlers(): void {
+  if (shutdownHandlersInstalled) return;
+  shutdownHandlersInstalled = true;
+  const handler = (signal: NodeJS.Signals) => {
+    flushActiveRuns();
+    // Attaching a listener for SIGINT/SIGTERM suppresses Node's
+    // default termination, so we have to provide an exit path
+    // ourselves or the process hangs after Ctrl+C. When another
+    // listener is also registered (e.g. the sandbox shutdown handler
+    // in `deepsec/sandbox/shutdown.ts`), defer to it — that handler
+    // needs async cleanup time and calls process.exit() itself once
+    // its sandboxes have stopped (or its 10s timeout fires).
+    //
+    // listenerCount counts the currently-executing handler too, so
+    // "1" means we're the only listener.
+    if (process.listenerCount(signal) <= 1) {
+      // Conventional signal exit codes: 128 + signal number
+      // (SIGINT=2 → 130, SIGTERM=15 → 143).
+      process.exit(signal === "SIGINT" ? 130 : 143);
+    }
+  };
+  process.on("SIGINT", handler);
+  process.on("SIGTERM", handler);
+  // beforeExit covers the case where a thrown error bubbles out of
+  // `process()` / `revalidate()` without `unregisterActiveRun` being
+  // called — without this, the run would be stranded at `phase:
+  // "running"` even though the node process is on its way out.
+  process.on("beforeExit", flushActiveRuns);
+}
+
+/**
+ * Register a run so that SIGINT/SIGTERM marks it as `phase: "error"`
+ * before the process exits. Call `unregisterActiveRun` (returned) when
+ * the run completes normally — leaving stale entries would cause us to
+ * try to error-flip already-completed runs at process exit.
+ */
+export function registerActiveRun(projectId: string, runId: string): () => void {
+  installShutdownHandlers();
+  const key = `${projectId}::${runId}`;
+  activeRuns.set(key, { projectId, runId });
+  let unregistered = false;
+  return () => {
+    if (unregistered) return;
+    unregistered = true;
+    activeRuns.delete(key);
+  };
 }
 
 export function listRuns(projectId: string): RunMeta[] {

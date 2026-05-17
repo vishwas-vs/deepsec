@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { createRunMeta, ensureProject, generateRunId } from "../run.js";
+import { createRunMeta, ensureProject, generateRunId, isPidAlive } from "../run.js";
 
 describe("generateRunId", () => {
   it("returns a string with timestamp and suffix", () => {
@@ -47,6 +47,29 @@ describe("createRunMeta", () => {
 
     expect(meta.type).toBe("process");
     expect(meta.processorConfig?.agentType).toBe("claude-agent-sdk");
+  });
+
+  it("captures pid and hostname for crash recovery", () => {
+    const meta = createRunMeta({
+      projectId: "test",
+      rootPath: "/tmp",
+      type: "process",
+    });
+    expect(meta.pid).toBe(process.pid);
+    expect(meta.hostname).toBe(os.hostname());
+  });
+});
+
+describe("isPidAlive", () => {
+  it("returns true for the current process", () => {
+    expect(isPidAlive(process.pid)).toBe(true);
+  });
+
+  it("returns false for a PID that does not exist", () => {
+    // PID 0x7fffffff is well outside the kernel's pid_max on every
+    // platform we run on, so the kernel can't possibly be tracking a
+    // live process at that number — process.kill(pid, 0) gives ESRCH.
+    expect(isPidAlive(0x7fffffff)).toBe(false);
   });
 });
 

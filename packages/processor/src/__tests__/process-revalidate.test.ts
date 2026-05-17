@@ -309,6 +309,155 @@ describe("processor with stub agent", () => {
     expect(stub.calls.investigateCalls).toHaveLength(1);
   });
 
+  it("process() reclaims a lock whose owning run's PID is no longer alive on this host", async () => {
+    // Crash recovery: the owning run hard-crashed (SIGKILL / OOM /
+    // power loss) before it could flip phase to error. RunMeta is
+    // stuck at phase=running with a recorded PID. Without the PID
+    // liveness check, the lock would stay held until STALE_LOCK_MS
+    // (1h) elapsed. The check should treat the dead PID as a signal
+    // that the owner is gone, and reclaim immediately.
+    const fx = setupProject({ files: ["app.ts"] });
+
+    const deadRunId = "20260101000000-deadpidaaaaaaaa1";
+    const lockedRec = pendingRecord(fx.projectId, "app.ts");
+    lockedRec.status = "processing";
+    lockedRec.lockedByRunId = deadRunId;
+    lockedRec.lockedAt = new Date().toISOString();
+    fx.writeRecord(lockedRec);
+    fs.mkdirSync(path.join(fx.dataRoot, fx.projectId, "runs"), { recursive: true });
+    fs.writeFileSync(
+      path.join(fx.dataRoot, fx.projectId, "runs", `${deadRunId}.json`),
+      JSON.stringify({
+        runId: deadRunId,
+        projectId: fx.projectId,
+        rootPath: fx.targetRoot,
+        createdAt: new Date().toISOString(),
+        type: "process",
+        phase: "running",
+        pid: 0x7fffffff, // not a live PID on any sane system
+        hostname: os.hostname(),
+        stats: {},
+      }),
+    );
+
+    const stub = new StubAgent();
+    setLoadedConfig(
+      defineConfig({
+        projects: [{ id: fx.projectId, root: fx.targetRoot }],
+        plugins: [{ name: "stub", agents: [stub] }],
+      }),
+    );
+
+    const result = await processProject({
+      projectId: fx.projectId,
+      agentType: "stub",
+      concurrency: 1,
+    });
+
+    expect(result.analysisCount).toBe(1);
+    expect(stub.calls.investigateCalls).toHaveLength(1);
+  });
+
+  it("process() does NOT reclaim a lock when the owning PID is on a different host", async () => {
+    // Cross-host: we can't probe a remote PID, so a phase=running run
+    // from a different machine should fall back to the timestamp
+    // staleness check (STALE_LOCK_MS). A fresh lock from another host
+    // is still respected.
+    const fx = setupProject({ files: ["app.ts"] });
+
+    const otherRunId = "20260101000000-crossaaaaaaaaaaa";
+    const lockedRec = pendingRecord(fx.projectId, "app.ts");
+    lockedRec.status = "processing";
+    lockedRec.lockedByRunId = otherRunId;
+    lockedRec.lockedAt = new Date().toISOString();
+    fx.writeRecord(lockedRec);
+    fs.mkdirSync(path.join(fx.dataRoot, fx.projectId, "runs"), { recursive: true });
+    fs.writeFileSync(
+      path.join(fx.dataRoot, fx.projectId, "runs", `${otherRunId}.json`),
+      JSON.stringify({
+        runId: otherRunId,
+        projectId: fx.projectId,
+        rootPath: fx.targetRoot,
+        createdAt: new Date().toISOString(),
+        type: "process",
+        phase: "running",
+        pid: 0x7fffffff,
+        hostname: `not-${os.hostname()}-different-host`,
+        stats: {},
+      }),
+    );
+
+    const stub = new StubAgent();
+    setLoadedConfig(
+      defineConfig({
+        projects: [{ id: fx.projectId, root: fx.targetRoot }],
+        plugins: [{ name: "stub", agents: [stub] }],
+      }),
+    );
+
+    const result = await processProject({
+      projectId: fx.projectId,
+      agentType: "stub",
+      concurrency: 1,
+    });
+
+    expect(stub.calls.investigateCalls).toHaveLength(0);
+    expect(result.analysisCount).toBe(0);
+    const after = fx.readRecord("app.ts");
+    expect(after.status).toBe("processing");
+    expect(after.lockedByRunId).toBe(otherRunId);
+  });
+
+  it("process() does NOT reclaim a lock when the owning PID is still alive on this host", async () => {
+    // The owning run is healthy and still investigating — same host,
+    // live PID. Even with a fresh lockedAt and phase=running, the
+    // reclaimer must respect it and skip the file.
+    const fx = setupProject({ files: ["app.ts"] });
+
+    const liveRunId = "20260101000000-livepidaaaaaaaaa";
+    const lockedRec = pendingRecord(fx.projectId, "app.ts");
+    lockedRec.status = "processing";
+    lockedRec.lockedByRunId = liveRunId;
+    lockedRec.lockedAt = new Date().toISOString();
+    fx.writeRecord(lockedRec);
+    fs.mkdirSync(path.join(fx.dataRoot, fx.projectId, "runs"), { recursive: true });
+    fs.writeFileSync(
+      path.join(fx.dataRoot, fx.projectId, "runs", `${liveRunId}.json`),
+      JSON.stringify({
+        runId: liveRunId,
+        projectId: fx.projectId,
+        rootPath: fx.targetRoot,
+        createdAt: new Date().toISOString(),
+        type: "process",
+        phase: "running",
+        // Our own pid — guaranteed alive while this test runs.
+        pid: process.pid,
+        hostname: os.hostname(),
+        stats: {},
+      }),
+    );
+
+    const stub = new StubAgent();
+    setLoadedConfig(
+      defineConfig({
+        projects: [{ id: fx.projectId, root: fx.targetRoot }],
+        plugins: [{ name: "stub", agents: [stub] }],
+      }),
+    );
+
+    const result = await processProject({
+      projectId: fx.projectId,
+      agentType: "stub",
+      concurrency: 1,
+    });
+
+    expect(stub.calls.investigateCalls).toHaveLength(0);
+    expect(result.analysisCount).toBe(0);
+    const after = fx.readRecord("app.ts");
+    expect(after.status).toBe("processing");
+    expect(after.lockedByRunId).toBe(liveRunId);
+  });
+
   it("process() captures refusals from the agent into AnalysisEntry", async () => {
     const fx = setupProject({ files: ["app.ts"] });
     fx.writeRecord(pendingRecord(fx.projectId, "app.ts"));

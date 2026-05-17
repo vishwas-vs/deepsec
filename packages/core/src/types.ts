@@ -8,6 +8,21 @@ export interface RunMeta {
   completedAt?: string;
   type: "scan" | "process" | "revalidate";
   phase: "running" | "done" | "error";
+  /**
+   * OS process id of the run owner, captured at `createRunMeta`. Combined
+   * with `hostname` it lets `isReclaimableLock` detect crashed runs
+   * (SIGKILL / OOM / power loss) on the same host immediately, instead of
+   * waiting out the 1h `STALE_LOCK_MS` for `phase === "running"` runs that
+   * will never call `completeRun`. Optional for backward compat with run
+   * metas written before this field existed.
+   */
+  pid?: number;
+  /**
+   * Hostname of the machine the run was started on. PID liveness is only
+   * meaningful on the same host; cross-host stale runs still fall back to
+   * the timestamp-based staleness check.
+   */
+  hostname?: string;
   scannerConfig?: {
     matcherSlugs: string[];
     /**

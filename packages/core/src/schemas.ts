@@ -174,6 +174,8 @@ export const runMetaSchema = z.object({
   completedAt: z.string().optional(),
   type: z.enum(["scan", "process", "revalidate"]),
   phase: z.enum(["running", "done", "error"]),
+  pid: z.number().optional(),
+  hostname: z.string().optional(),
   scannerConfig: z
     .object({
       matcherSlugs: z.array(z.string()),
