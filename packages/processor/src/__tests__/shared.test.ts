@@ -3,7 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  buildInvestigateJsonRepairPrompt,
+  buildRevalidateJsonRepairPrompt,
   classifyQuotaError,
+  formatJsonRepairFailureDebugText,
   isTransientError,
   isUsingAiGateway,
   parseInvestigateResults,
@@ -259,6 +262,41 @@ describe("parseRefusalReport", () => {
 
   it("returns undefined on empty input", () => {
     expect(parseRefusalReport("")).toBeUndefined();
+  });
+});
+
+describe("JSON repair prompts", () => {
+  it("asks investigation agents to re-output only JSON for the same batch files", () => {
+    const prompt = buildInvestigateJsonRepairPrompt([
+      { filePath: "apps/web/a.ts" } as any,
+      { filePath: "lib/b.ts" } as any,
+    ]);
+
+    expect(prompt).toContain("previous response was not valid JSON");
+    expect(prompt).toContain("Do not redo the investigation");
+    expect(prompt).toContain("ONLY one valid JSON array");
+    expect(prompt).toContain("- apps/web/a.ts");
+    expect(prompt).toContain("- lib/b.ts");
+    expect(prompt).toContain('"findings"');
+  });
+
+  it("asks revalidation agents to re-output only JSON verdicts", () => {
+    const prompt = buildRevalidateJsonRepairPrompt();
+
+    expect(prompt).toContain("previous response was not valid JSON");
+    expect(prompt).toContain("Do not redo the revalidation");
+    expect(prompt).toContain("ONLY one valid JSON array");
+    expect(prompt).toContain('"verdict"');
+    expect(prompt).toContain('"duplicateOf"');
+  });
+
+  it("preserves original and repair output in debug text when repair also fails", () => {
+    const debug = formatJsonRepairFailureDebugText("Confirmed: no issue", "{ not json");
+
+    expect(debug).toContain("# original malformed agent output");
+    expect(debug).toContain("Confirmed: no issue");
+    expect(debug).toContain("# JSON repair follow-up output");
+    expect(debug).toContain("{ not json");
   });
 });
 

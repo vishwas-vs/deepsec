@@ -433,6 +433,81 @@ export function writeParseFailureDebug(params: {
   }
 }
 
+function fileListForRepairPrompt(batch: FileRecord[]): string {
+  return batch.map((r) => `- ${r.filePath}`).join("\n");
+}
+
+export function buildInvestigateJsonRepairPrompt(batch: FileRecord[]): string {
+  return `Your previous response was not valid JSON, so the scanner could not parse it.
+
+Do not redo the investigation and do not use tools. Re-output the same conclusions from your previous response as ONLY one valid JSON array. No prose before or after. No "Confirmed:" preface. A \`\`\`json fenced block is acceptable, but the content inside must be valid JSON.
+
+Include exactly these target files, with an empty findings array for any file where you found no real issue:
+
+${fileListForRepairPrompt(batch)}
+
+Use this exact schema:
+
+\`\`\`json
+[
+  {
+    "filePath": "relative/path/to/file.ts",
+    "findings": [
+      {
+        "severity": "HIGH",
+        "vulnSlug": "the-vuln-slug-or-other",
+        "title": "Brief title of the issue",
+        "description": "Detailed description of the vulnerability, the attack scenario, and evidence from the code",
+        "lineNumbers": [10, 15],
+        "recommendation": "How to fix this vulnerability",
+        "confidence": "high"
+      }
+    ]
+  }
+]
+\`\`\`
+
+\`severity\` must be one of \`CRITICAL\`, \`HIGH\`, \`MEDIUM\`, \`HIGH_BUG\`, or \`BUG\`. \`confidence\` must be one of \`high\`, \`medium\`, or \`low\`.`;
+}
+
+export function buildRevalidateJsonRepairPrompt(): string {
+  return `Your previous response was not valid JSON, so the scanner could not parse it.
+
+Do not redo the revalidation and do not use tools. Re-output the same verdicts and reasoning from your previous response as ONLY one valid JSON array. No prose before or after. No "Confirmed:" preface. A \`\`\`json fenced block is acceptable, but the content inside must be valid JSON.
+
+Use this exact schema:
+
+\`\`\`json
+[
+  {
+    "filePath": "exact/path/to/file.ts",
+    "title": "exact title from the finding",
+    "verdict": "true-positive",
+    "adjustedSeverity": "HIGH",
+    "duplicateOf": "title of the primary finding (only when verdict is duplicate)",
+    "reasoning": "Detailed explanation. Show your work."
+  }
+]
+\`\`\`
+
+\`verdict\` must be one of \`true-positive\`, \`false-positive\`, \`fixed\`, \`uncertain\`, or \`duplicate\`. \`adjustedSeverity\` is optional and must be one of \`CRITICAL\`, \`HIGH\`, \`MEDIUM\`, \`HIGH_BUG\`, or \`BUG\` when present. \`duplicateOf\` is required only when \`verdict\` is \`"duplicate"\`; omit it otherwise.`;
+}
+
+export function formatJsonRepairFailureDebugText(originalText: string, repairText: string): string {
+  return (
+    `# original malformed agent output\n${originalText}\n\n` +
+    `# JSON repair follow-up output\n${repairText}`
+  );
+}
+
+export function jsonRepairFailureError(originalError: unknown, repairError: unknown): Error {
+  const original = originalError instanceof Error ? originalError.message : String(originalError);
+  const repair = repairError instanceof Error ? repairError.message : String(repairError);
+  return new Error(
+    `JSON repair follow-up also failed: ${repair}. Original parse error: ${original}`,
+  );
+}
+
 export function parseInvestigateResults(
   resultText: string,
   batch: FileRecord[],

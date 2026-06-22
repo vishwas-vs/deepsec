@@ -14,10 +14,14 @@ import {
 } from "@openai/codex-sdk";
 import {
   backoff,
+  buildInvestigateJsonRepairPrompt,
   buildInvestigatePrompt,
+  buildRevalidateJsonRepairPrompt,
   buildRevalidatePrompt,
   classifyQuotaError,
+  formatJsonRepairFailureDebugText,
   isTransientError,
+  jsonRepairFailureError,
   MAX_ATTEMPTS,
   parseInvestigateResults,
   parseRefusalReport,
@@ -604,6 +608,24 @@ async function runRefusalFollowUp(
   projectRoot: string,
   model: string,
 ): Promise<RefusalReport | undefined> {
+  const raw = await runToollessFollowUp(
+    codex,
+    threadId,
+    projectRoot,
+    model,
+    REFUSAL_FOLLOWUP_PROMPT,
+  );
+  if (raw === undefined) return undefined;
+  return parseRefusalReport(raw);
+}
+
+async function runToollessFollowUp(
+  codex: Codex,
+  threadId: string | undefined,
+  projectRoot: string,
+  model: string,
+  prompt: string,
+): Promise<string | undefined> {
   if (!threadId) return undefined;
 
   let raw = "";
@@ -617,13 +639,13 @@ async function runRefusalFollowUp(
       networkAccessEnabled: false,
       modelReasoningEffort: "low",
     });
-    const turn = await thread.run(REFUSAL_FOLLOWUP_PROMPT);
+    const turn = await thread.run(prompt);
     raw = turn.finalResponse ?? "";
   } catch {
     return undefined;
   }
 
-  return parseRefusalReport(raw);
+  return raw;
 }
 
 export class CodexAgentSdkPlugin implements AgentPlugin {
@@ -823,13 +845,6 @@ export class CodexAgentSdkPlugin implements AgentPlugin {
           throw new QuotaExhaustedError(quotaSourceFinal, stderrTail);
         }
       }
-      const refusal = await runRefusalFollowUp(codex, threadId, projectRoot, model);
-      if (refusal?.refused) {
-        yield {
-          type: "thinking" as const,
-          message: `Refusal detected: ${refusal.reason ?? refusal.skipped?.map((s) => s.filePath ?? "?").join(", ") ?? "see raw"}`,
-        };
-      }
 
       // Empty-result check runs BEFORE parse so a silent failure throws
       // with the captured stderr instead of crashing inside the parser
@@ -849,15 +864,43 @@ export class CodexAgentSdkPlugin implements AgentPlugin {
       try {
         parsed = parseInvestigateResults(resultText, batch);
       } catch (err) {
-        writeParseFailureDebug({
-          projectId,
-          phase: "investigate",
-          agentType: this.type,
-          resultText,
-          error: err,
-          batch,
-        });
-        throw err;
+        yield {
+          type: "thinking" as const,
+          message: "Codex returned non-JSON investigation output; requesting JSON-only repair",
+        };
+        const repairText = await runToollessFollowUp(
+          codex,
+          threadId,
+          projectRoot,
+          model,
+          buildInvestigateJsonRepairPrompt(batch),
+        );
+        if (repairText === undefined) {
+          writeParseFailureDebug({
+            projectId,
+            phase: "investigate",
+            agentType: this.type,
+            resultText,
+            error: err,
+            batch,
+          });
+          throw err;
+        }
+        try {
+          parsed = parseInvestigateResults(repairText, batch);
+          yield { type: "thinking" as const, message: "Codex JSON repair succeeded" };
+        } catch (repairErr) {
+          const combinedError = jsonRepairFailureError(err, repairErr);
+          writeParseFailureDebug({
+            projectId,
+            phase: "investigate",
+            agentType: this.type,
+            resultText: formatJsonRepairFailureDebugText(resultText, repairText),
+            error: combinedError,
+            batch,
+          });
+          throw combinedError;
+        }
       }
       if (DEBUG) {
         const matched = parsed.filter((r) => r.findings.length > 0).length;
@@ -865,6 +908,14 @@ export class CodexAgentSdkPlugin implements AgentPlugin {
         yield {
           type: "thinking",
           message: `[debug] parsed: ${parsed.length} entries, ${matched} with findings, ${totalFindings} total findings`,
+        };
+      }
+
+      const refusal = await runRefusalFollowUp(codex, threadId, projectRoot, model);
+      if (refusal?.refused) {
+        yield {
+          type: "thinking" as const,
+          message: `Refusal detected: ${refusal.reason ?? refusal.skipped?.map((s) => s.filePath ?? "?").join(", ") ?? "see raw"}`,
         };
       }
 
@@ -1055,14 +1106,6 @@ export class CodexAgentSdkPlugin implements AgentPlugin {
         }
       }
 
-      const refusal = await runRefusalFollowUp(codex, threadId, projectRoot, model);
-      if (refusal?.refused) {
-        yield {
-          type: "thinking" as const,
-          message: `Refusal detected during revalidation: ${refusal.reason ?? "see raw"}`,
-        };
-      }
-
       // Empty-result throw before parse so silent failures don't crash inside
       // parseRevalidateVerdicts and bypass the cleanup in finally.
       if (!resultText) {
@@ -1079,20 +1122,56 @@ export class CodexAgentSdkPlugin implements AgentPlugin {
       try {
         verdicts = parseRevalidateVerdicts(resultText);
       } catch (err) {
-        writeParseFailureDebug({
-          projectId,
-          phase: "revalidate",
-          agentType: this.type,
-          resultText,
-          error: err,
-          batch,
-        });
-        throw err;
+        yield {
+          type: "thinking" as const,
+          message: "Codex returned non-JSON revalidation output; requesting JSON-only repair",
+        };
+        const repairText = await runToollessFollowUp(
+          codex,
+          threadId,
+          projectRoot,
+          model,
+          buildRevalidateJsonRepairPrompt(),
+        );
+        if (repairText === undefined) {
+          writeParseFailureDebug({
+            projectId,
+            phase: "revalidate",
+            agentType: this.type,
+            resultText,
+            error: err,
+            batch,
+          });
+          throw err;
+        }
+        try {
+          verdicts = parseRevalidateVerdicts(repairText);
+          yield { type: "thinking" as const, message: "Codex JSON repair succeeded" };
+        } catch (repairErr) {
+          const combinedError = jsonRepairFailureError(err, repairErr);
+          writeParseFailureDebug({
+            projectId,
+            phase: "revalidate",
+            agentType: this.type,
+            resultText: formatJsonRepairFailureDebugText(resultText, repairText),
+            error: combinedError,
+            batch,
+          });
+          throw combinedError;
+        }
       }
       if (DEBUG) {
         yield {
           type: "thinking",
           message: `[debug] parsed ${verdicts.length} verdicts`,
+        };
+      }
+
+      const refusal = await runRefusalFollowUp(codex, threadId, projectRoot, model);
+      if (refusal?.refused) {
+        yield {
+          type: "thinking" as const,
+          message: `Refusal detected during revalidation: ${refusal.reason ?? "see raw"}`,
         };
       }
 

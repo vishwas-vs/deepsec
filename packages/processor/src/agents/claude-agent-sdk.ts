@@ -2,10 +2,14 @@ import { query, type SandboxSettings } from "@anthropic-ai/claude-agent-sdk";
 import type { RefusalReport } from "@deepsec/core";
 import {
   backoff,
+  buildInvestigateJsonRepairPrompt,
   buildInvestigatePrompt,
+  buildRevalidateJsonRepairPrompt,
   buildRevalidatePrompt,
   classifyQuotaError,
+  formatJsonRepairFailureDebugText,
   isTransientError,
+  jsonRepairFailureError,
   MAX_ATTEMPTS,
   parseInvestigateResults,
   parseRefusalReport,
@@ -139,12 +143,23 @@ async function runRefusalFollowUp(
   model: string,
   projectRoot: string,
 ): Promise<RefusalReport | undefined> {
+  const raw = await runToollessFollowUp(sessionId, model, projectRoot, REFUSAL_FOLLOWUP_PROMPT);
+  if (raw === undefined) return undefined;
+  return parseRefusalReport(raw);
+}
+
+async function runToollessFollowUp(
+  sessionId: string | undefined,
+  model: string,
+  projectRoot: string,
+  prompt: string,
+): Promise<string | undefined> {
   if (!sessionId) return undefined;
 
   let raw = "";
   try {
     for await (const message of query({
-      prompt: REFUSAL_FOLLOWUP_PROMPT,
+      prompt,
       options: {
         cwd: projectRoot,
         allowedTools: [],
@@ -168,7 +183,7 @@ async function runRefusalFollowUp(
     return undefined;
   }
 
-  return parseRefusalReport(raw);
+  return raw;
 }
 
 export class ClaudeAgentSdkPlugin implements AgentPlugin {
@@ -363,23 +378,6 @@ export class ClaudeAgentSdkPlugin implements AgentPlugin {
     }
 
     const durationMs = Date.now() - startTime;
-    const costStr = sdkMeta.costUsd != null ? ` $${sdkMeta.costUsd.toFixed(3)}` : "";
-    const tokensStr = sdkMeta.usage
-      ? ` ${sdkMeta.usage.inputTokens + sdkMeta.usage.outputTokens} tokens`
-      : "";
-
-    const refusal = await runRefusalFollowUp(sessionId, model, projectRoot);
-    if (refusal?.refused) {
-      yield {
-        type: "thinking" as const,
-        message: `Refusal detected: ${refusal.reason ?? refusal.skipped?.map((s) => s.filePath ?? "?").join(", ") ?? "see raw"}`,
-      };
-    }
-
-    yield {
-      type: "complete",
-      message: `Investigation complete (${(durationMs / 1000).toFixed(1)}s, ${turnCount} turns, ${toolUseCount} tool calls${costStr}${tokensStr}${refusal?.refused ? " ⚠️  refusal" : ""})`,
-    };
 
     // Hard-fail when the SDK never produced a result. Without this throw
     // the empty resultText falls through to `parseInvestigateResults` →
@@ -397,16 +395,61 @@ export class ClaudeAgentSdkPlugin implements AgentPlugin {
     try {
       results = parseInvestigateResults(resultText, batch);
     } catch (err) {
-      writeParseFailureDebug({
-        projectId,
-        phase: "investigate",
-        agentType: this.type,
-        resultText,
-        error: err,
-        batch,
-      });
-      throw err;
+      yield {
+        type: "thinking" as const,
+        message: "Claude returned non-JSON investigation output; requesting JSON-only repair",
+      };
+      const repairText = await runToollessFollowUp(
+        sessionId,
+        model,
+        projectRoot,
+        buildInvestigateJsonRepairPrompt(batch),
+      );
+      if (repairText === undefined) {
+        writeParseFailureDebug({
+          projectId,
+          phase: "investigate",
+          agentType: this.type,
+          resultText,
+          error: err,
+          batch,
+        });
+        throw err;
+      }
+      try {
+        results = parseInvestigateResults(repairText, batch);
+        resultText = repairText;
+        yield { type: "thinking" as const, message: "Claude JSON repair succeeded" };
+      } catch (repairErr) {
+        const combinedError = jsonRepairFailureError(err, repairErr);
+        writeParseFailureDebug({
+          projectId,
+          phase: "investigate",
+          agentType: this.type,
+          resultText: formatJsonRepairFailureDebugText(resultText, repairText),
+          error: combinedError,
+          batch,
+        });
+        throw combinedError;
+      }
     }
+
+    const refusal = await runRefusalFollowUp(sessionId, model, projectRoot);
+    if (refusal?.refused) {
+      yield {
+        type: "thinking" as const,
+        message: `Refusal detected: ${refusal.reason ?? refusal.skipped?.map((s) => s.filePath ?? "?").join(", ") ?? "see raw"}`,
+      };
+    }
+
+    const costStr = sdkMeta.costUsd != null ? ` $${sdkMeta.costUsd.toFixed(3)}` : "";
+    const tokensStr = sdkMeta.usage
+      ? ` ${sdkMeta.usage.inputTokens + sdkMeta.usage.outputTokens} tokens`
+      : "";
+    yield {
+      type: "complete",
+      message: `Investigation complete (${(durationMs / 1000).toFixed(1)}s, ${turnCount} turns, ${toolUseCount} tool calls${costStr}${tokensStr}${refusal?.refused ? " ⚠️  refusal" : ""})`,
+    };
 
     return {
       results,
@@ -549,20 +592,55 @@ export class ClaudeAgentSdkPlugin implements AgentPlugin {
       await backoff(attempt);
     }
 
+    if (!resultText) {
+      throw new Error(
+        `Claude Agent SDK produced no revalidation result after ${MAX_ATTEMPTS} attempt(s). ` +
+          `Last error: ${lastError || "(none captured)"}.`,
+      );
+    }
+
     const durationMs = Date.now() - startTime;
     let verdicts: RevalidateVerdict[];
     try {
       verdicts = parseRevalidateVerdicts(resultText);
     } catch (err) {
-      writeParseFailureDebug({
-        projectId,
-        phase: "revalidate",
-        agentType: this.type,
-        resultText,
-        error: err,
-        batch,
-      });
-      throw err;
+      yield {
+        type: "thinking" as const,
+        message: "Claude returned non-JSON revalidation output; requesting JSON-only repair",
+      };
+      const repairText = await runToollessFollowUp(
+        sdkMeta.agentSessionId,
+        model,
+        projectRoot,
+        buildRevalidateJsonRepairPrompt(),
+      );
+      if (repairText === undefined) {
+        writeParseFailureDebug({
+          projectId,
+          phase: "revalidate",
+          agentType: this.type,
+          resultText,
+          error: err,
+          batch,
+        });
+        throw err;
+      }
+      try {
+        verdicts = parseRevalidateVerdicts(repairText);
+        resultText = repairText;
+        yield { type: "thinking" as const, message: "Claude JSON repair succeeded" };
+      } catch (repairErr) {
+        const combinedError = jsonRepairFailureError(err, repairErr);
+        writeParseFailureDebug({
+          projectId,
+          phase: "revalidate",
+          agentType: this.type,
+          resultText: formatJsonRepairFailureDebugText(resultText, repairText),
+          error: combinedError,
+          batch,
+        });
+        throw combinedError;
+      }
     }
 
     const refusal = await runRefusalFollowUp(sdkMeta.agentSessionId, model, projectRoot);
@@ -578,13 +656,6 @@ export class ClaudeAgentSdkPlugin implements AgentPlugin {
       type: "complete",
       message: `Revalidation complete (${(durationMs / 1000).toFixed(1)}s, ${turnCount} turns${costStr}, ${verdicts.length} verdicts${refusal?.refused ? " ⚠️  refusal" : ""})`,
     };
-
-    if (!resultText) {
-      throw new Error(
-        `Claude Agent SDK produced no revalidation result after ${MAX_ATTEMPTS} attempt(s). ` +
-          `Last error: ${lastError || "(none captured)"}.`,
-      );
-    }
 
     return {
       verdicts,

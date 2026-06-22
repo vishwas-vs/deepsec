@@ -19,10 +19,14 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
   backoff,
+  buildInvestigateJsonRepairPrompt,
   buildInvestigatePrompt,
+  buildRevalidateJsonRepairPrompt,
   buildRevalidatePrompt,
   classifyQuotaError,
+  formatJsonRepairFailureDebugText,
   isTransientError,
+  jsonRepairFailureError,
   MAX_ATTEMPTS,
   parseInvestigateResults,
   parseRefusalReport,
@@ -47,6 +51,7 @@ const DEFAULT_MODEL = "zai/glm-5.2";
 const DEFAULT_THINKING_LEVEL = "xhigh";
 const DEFAULT_TOOLS = ["read", "grep", "find", "ls"];
 const GATEWAY_PROVIDER = "vercel-ai-gateway";
+const TOOL_ERROR_DETAIL_LIMIT = 500;
 
 const DEEPSEC_SYSTEM_NOTE =
   "You are running inside the Pi harness for deepsec. Use source inspection only. Do not run the target application, send network requests, or attempt exploitation. Return only the requested JSON object.";
@@ -409,6 +414,67 @@ function shortTarget(input: unknown): string | undefined {
   return undefined;
 }
 
+function compactOneLine(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function truncateLogDetail(value: string): string {
+  const compacted = compactOneLine(value);
+  if (compacted.length <= TOOL_ERROR_DETAIL_LIMIT) return compacted;
+  return `${compacted.slice(0, TOOL_ERROR_DETAIL_LIMIT)}...`;
+}
+
+function textFromToolContent(content: unknown): string | undefined {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  const parts: string[] = [];
+  for (const item of content) {
+    if (typeof item === "string") {
+      parts.push(item);
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    if (typeof record.text === "string") parts.push(record.text);
+  }
+  return parts.length > 0 ? parts.join(" ") : undefined;
+}
+
+function summarizeToolError(result: unknown): string | undefined {
+  if (!result) return undefined;
+  if (typeof result === "string") return truncateLogDetail(result);
+  if (result instanceof Error) return truncateLogDetail(result.message);
+  if (typeof result !== "object") return truncateLogDetail(String(result));
+
+  const record = result as Record<string, unknown>;
+  for (const key of ["error", "message", "reason", "stderr", "stdout"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return truncateLogDetail(value);
+    }
+  }
+
+  const contentText = textFromToolContent(record.content);
+  if (contentText) return truncateLogDetail(contentText);
+
+  try {
+    return truncateLogDetail(JSON.stringify(result));
+  } catch {
+    return undefined;
+  }
+}
+
+function formatToolErrorMessage(
+  toolName: string | undefined,
+  target: string | undefined,
+  result: unknown,
+): string {
+  const targetStr = target ? `: ${target}` : "";
+  const detail = summarizeToolError(result);
+  const detailStr = detail ? ` - ${detail}` : "";
+  return `Pi tool error: ${toolName ?? "tool"}${targetStr}${detailStr}`;
+}
+
 function batchMetaFromSession(session: AgentSession, durationMs: number): Partial<BatchMeta> {
   const stats = session.getSessionStats();
   return {
@@ -440,6 +506,7 @@ async function* runPiPrompt(params: {
   let promptError: unknown;
   let turnCount = 0;
   let toolUseCount = 0;
+  const toolTargets = new Map<string, string | undefined>();
 
   const wake = () => {
     const fn = notify;
@@ -468,6 +535,7 @@ async function* runPiPrompt(params: {
       case "tool_execution_start": {
         toolUseCount++;
         const target = shortTarget(e.args);
+        if (typeof e.toolCallId === "string") toolTargets.set(e.toolCallId, target);
         push({
           type: "tool_use",
           message: `${e.toolName ?? "tool"}${target ? `: ${target}` : ""}`,
@@ -477,11 +545,14 @@ async function* runPiPrompt(params: {
       }
       case "tool_execution_end":
         if (e.isError) {
+          const target =
+            typeof e.toolCallId === "string" ? toolTargets.get(e.toolCallId) : undefined;
           push({
             type: "error",
-            message: `Pi tool error: ${e.toolName ?? "tool"}`,
+            message: formatToolErrorMessage(e.toolName, target, e.result),
           });
         }
+        if (typeof e.toolCallId === "string") toolTargets.delete(e.toolCallId);
         break;
       case "auto_retry_start":
         push({
@@ -553,6 +624,16 @@ async function runRefusalFollowUp(
   session: AgentSession | undefined,
   signal?: AbortSignal,
 ): Promise<RefusalReport | undefined> {
+  const raw = await runToollessFollowUp(session, REFUSAL_FOLLOWUP_PROMPT, signal);
+  if (raw === undefined) return undefined;
+  return parseRefusalReport(raw);
+}
+
+async function runToollessFollowUp(
+  session: AgentSession | undefined,
+  prompt: string,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
   if (!session) return undefined;
   const previousTools = session.getActiveToolNames();
   const abort = () => void session.abort();
@@ -562,11 +643,11 @@ async function runRefusalFollowUp(
   }
   try {
     session.setActiveToolsByName([]);
-    await session.prompt(REFUSAL_FOLLOWUP_PROMPT, {
+    await session.prompt(prompt, {
       expandPromptTemplates: false,
       source: "programmatic" as never,
     });
-    return parseRefusalReport(session.getLastAssistantText() ?? "");
+    return session.getLastAssistantText() ?? "";
   } catch {
     return undefined;
   } finally {
@@ -643,7 +724,59 @@ export class PiAgentPlugin implements AgentPlugin {
       await backoff(attempt);
     }
 
+    if (!resultText) {
+      session?.dispose();
+      throw new Error(
+        `Pi produced no investigation result after ${MAX_ATTEMPTS} attempt(s). ` +
+          `Last error: ${lastError || "(none captured)"}.`,
+      );
+    }
+
     const durationMs = Date.now() - startTime;
+    let results: InvestigateResult[];
+    try {
+      results = parseInvestigateResults(resultText, batch);
+    } catch (err) {
+      yield {
+        type: "thinking",
+        message: "Pi returned non-JSON investigation output; requesting JSON-only repair",
+      };
+      const repairText = await runToollessFollowUp(
+        session,
+        buildInvestigateJsonRepairPrompt(batch),
+        signal,
+      );
+      if (repairText === undefined) {
+        writeParseFailureDebug({
+          projectId,
+          phase: "investigate",
+          agentType: this.type,
+          resultText,
+          error: err,
+          batch,
+        });
+        session?.dispose();
+        throw err;
+      }
+      try {
+        results = parseInvestigateResults(repairText, batch);
+        resultText = repairText;
+        yield { type: "thinking", message: "Pi JSON repair succeeded" };
+      } catch (repairErr) {
+        const combinedError = jsonRepairFailureError(err, repairErr);
+        writeParseFailureDebug({
+          projectId,
+          phase: "investigate",
+          agentType: this.type,
+          resultText: formatJsonRepairFailureDebugText(resultText, repairText),
+          error: combinedError,
+          batch,
+        });
+        session?.dispose();
+        throw combinedError;
+      }
+    }
+
     const refusal = await runRefusalFollowUp(session, signal);
     if (refusal?.refused) {
       yield {
@@ -660,30 +793,6 @@ export class PiAgentPlugin implements AgentPlugin {
       type: "complete",
       message: `Investigation complete (${(durationMs / 1000).toFixed(1)}s, ${turnCount} turns, ${toolUseCount} tool calls${costStr}${tokensStr}${refusal?.refused ? " refusal" : ""})`,
     };
-
-    if (!resultText) {
-      session?.dispose();
-      throw new Error(
-        `Pi produced no investigation result after ${MAX_ATTEMPTS} attempt(s). ` +
-          `Last error: ${lastError || "(none captured)"}.`,
-      );
-    }
-
-    let results: InvestigateResult[];
-    try {
-      results = parseInvestigateResults(resultText, batch);
-    } catch (err) {
-      writeParseFailureDebug({
-        projectId,
-        phase: "investigate",
-        agentType: this.type,
-        resultText,
-        error: err,
-        batch,
-      });
-      session?.dispose();
-      throw err;
-    }
 
     session?.dispose();
     return {
@@ -766,21 +875,57 @@ export class PiAgentPlugin implements AgentPlugin {
       await backoff(attempt);
     }
 
+    if (!resultText) {
+      session?.dispose();
+      throw new Error(
+        `Pi produced no revalidation result after ${MAX_ATTEMPTS} attempt(s). ` +
+          `Last error: ${lastError || "(none captured)"}.`,
+      );
+    }
+
     const durationMs = Date.now() - startTime;
     let verdicts: RevalidateVerdict[];
     try {
       verdicts = parseRevalidateVerdicts(resultText);
     } catch (err) {
-      writeParseFailureDebug({
-        projectId,
-        phase: "revalidate",
-        agentType: this.type,
-        resultText,
-        error: err,
-        batch,
-      });
-      session?.dispose();
-      throw err;
+      yield {
+        type: "thinking",
+        message: "Pi returned non-JSON revalidation output; requesting JSON-only repair",
+      };
+      const repairText = await runToollessFollowUp(
+        session,
+        buildRevalidateJsonRepairPrompt(),
+        signal,
+      );
+      if (repairText === undefined) {
+        writeParseFailureDebug({
+          projectId,
+          phase: "revalidate",
+          agentType: this.type,
+          resultText,
+          error: err,
+          batch,
+        });
+        session?.dispose();
+        throw err;
+      }
+      try {
+        verdicts = parseRevalidateVerdicts(repairText);
+        resultText = repairText;
+        yield { type: "thinking", message: "Pi JSON repair succeeded" };
+      } catch (repairErr) {
+        const combinedError = jsonRepairFailureError(err, repairErr);
+        writeParseFailureDebug({
+          projectId,
+          phase: "revalidate",
+          agentType: this.type,
+          resultText: formatJsonRepairFailureDebugText(resultText, repairText),
+          error: combinedError,
+          batch,
+        });
+        session?.dispose();
+        throw combinedError;
+      }
     }
 
     const refusal = await runRefusalFollowUp(session, signal);
@@ -796,14 +941,6 @@ export class PiAgentPlugin implements AgentPlugin {
       type: "complete",
       message: `Revalidation complete (${(durationMs / 1000).toFixed(1)}s, ${turnCount} turns, ${toolUseCount} tool calls${costStr}, ${verdicts.length} verdicts${refusal?.refused ? " refusal" : ""})`,
     };
-
-    if (!resultText) {
-      session?.dispose();
-      throw new Error(
-        `Pi produced no revalidation result after ${MAX_ATTEMPTS} attempt(s). ` +
-          `Last error: ${lastError || "(none captured)"}.`,
-      );
-    }
 
     session?.dispose();
     return {
